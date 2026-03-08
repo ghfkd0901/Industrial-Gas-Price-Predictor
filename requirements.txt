@@ -8,3 +8,4 @@ gspread-dataframe
 scikit-learn
 xgboost
 yfinance
+matplotlib
