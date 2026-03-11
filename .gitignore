@@ -1,0 +1,23 @@
+# 1. 사용자 지정 제외 폴더 (기존파일)
+기존파일/
+
+# 2. Streamlit 및 보안 관련
+.streamlit/
+# secrets.toml은 API 키나 인증 정보가 들어있으므로 반드시 제외해야 합니다.
+.streamlit/secrets.toml
+
+# 3. 데이터 및 가상환경
+data/
+venv/
+.venv/
+env/
+
+# 4. Python 캐시 및 시스템 파일
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+Thumbs.db
+
+# 5. 기타 (VS Code 설정 등)
+.vscode/
