@@ -100,7 +100,6 @@ def get_feature_cols(preset_key: str) -> list:
 def get_train_xy(merged: pd.DataFrame, feature_cols: list, train_start: pd.Timestamp, train_end: pd.Timestamp):
     required = feature_cols + ["Wholesale_Price"]
     train_df = merged.dropna(subset=required)
-    # 학습 기간 필터링
     train_df = train_df[(train_df.index >= train_start) & (train_df.index <= train_end)]
     return train_df[feature_cols], train_df["Wholesale_Price"]
 
@@ -250,7 +249,6 @@ def plot_forecast(
 ) -> go.Figure:
     fig = go.Figure()
 
-    # 학습 기간 배경 표시
     fig.add_vrect(
         x0=train_start, x1=train_end,
         fillcolor="lightyellow", opacity=0.25,
@@ -304,6 +302,12 @@ def plot_forecast(
 def main():
     st.title("🏛️ 대성에너지 도매요금 AI 시뮬레이션 시스템")
 
+    # ── session_state 초기화 ──────────────────────────────
+    if "forecast_result" not in st.session_state:
+        st.session_state.forecast_result = None   # 예측 결과 DataFrame
+    if "forecast_snapshot" not in st.session_state:
+        st.session_state.forecast_snapshot = None # 예측 당시 edited_df 스냅샷
+
     with st.spinner("📡 Google Sheets 데이터 불러오는 중..."):
         try:
             merged, master_raw = load_all_data()
@@ -312,7 +316,6 @@ def main():
             st.stop()
 
     last_date = merged["Wholesale_Price"].dropna().index.max()
-    data_start = merged.index.min()
 
     # ── 사이드바 ──────────────────────────────────────────
     with st.sidebar:
@@ -349,7 +352,6 @@ def main():
         train_start = pd.Timestamp(f"{train_start_year}-01-01")
         train_end   = pd.Timestamp(f"{train_end_year}-12-31")
 
-        # 학습 데이터 건수 미리 계산해서 표시
         _X_check, _y_check = get_train_xy(merged, feature_cols, train_start, train_end)
         n_train = len(_X_check)
         if n_train < 10:
@@ -413,6 +415,8 @@ def main():
         st.divider()
         if st.button("🔄 데이터 새로고침", use_container_width=True):
             st.cache_data.clear()
+            st.session_state.forecast_result = None
+            st.session_state.forecast_snapshot = None
             st.rerun()
         st.caption(f"📅 데이터 기준: **{last_date.strftime('%Y-%m')}**")
 
@@ -425,9 +429,7 @@ def main():
         )
         st.stop()
 
-    # 차트 실제값: Lag 무관하게 Wholesale_Price 전체 (2015-01부터 표시)
     y_all = merged["Wholesale_Price"].dropna()
-    # R² 전체기간용: feature 매핑 가능한 범위만
     X_all_r2, y_all_r2 = get_train_xy(merged, feature_cols,
                                        merged.index.min(), merged.index.max())
 
@@ -480,77 +482,113 @@ def main():
         height=min(35 * forecast_months + 60, 500),
     )
 
-    # ── Step 2: 예측 & 차트 ──────────────────────────────
+    # ── 예측하기 버튼 ─────────────────────────────────────
     st.divider()
-    st.markdown("### 📈 Step 2. AI 모델별 도매요금 예측 결과")
 
-    if not selected_models:
-        st.warning("⚠️ 사이드바에서 표시할 모델을 1개 이상 선택하세요.")
-        st.stop()
-
-    active_models = {k: v for k, v in models.items() if k in selected_models}
-    future_df = run_forecast(edited_df, active_models, feature_cols, preset_key)
-
-    fig = plot_forecast(
-        y_all, y_all.index, future_df, last_date,
-        train_start, train_end, selected_models
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    # ── Step 3: 가로형 수치 테이블 ───────────────────────
-    st.subheader("📋 산업용 가스요금 전망 (원/MJ)")
-
-    date_cols = [d.strftime("%Y-%m") for d in sorted(future_df["Date"].unique())]
-    idx_df = edited_df.set_index("날짜")
-
-    pivot_raw = future_df.pivot(index="Date", columns="Model", values="Price")
-    pivot_raw.index = pivot_raw.index.strftime("%Y-%m")
-
-    table_rows: dict = {}
-    for lbl, tbl_lbl in TABLE_LABELS.items():
-        if lbl in idx_df.columns:
-            table_rows[tbl_lbl] = {
-                d: idx_df.loc[d, lbl] if d in idx_df.index else "" for d in date_cols
-            }
-
-    for model_name in selected_models:
-        if model_name in pivot_raw.columns:
-            table_rows[f"예상요금 · {model_name}"] = {
-                d: pivot_raw.loc[d, model_name] if d in pivot_raw.index else ""
-                for d in date_cols
-            }
-
-    display_df = pd.DataFrame(table_rows, index=date_cols).T
-    display_df.index.name = "구분"
-
-    def highlight_table(df):
-        styles = pd.DataFrame("", index=df.index, columns=df.columns)
-        indicator_rows = [r for r in df.index if "예상요금" not in r]
-        for r in indicator_rows:
-            styles.loc[r, :] = "background-color: #f5f5f5; font-weight: bold"
-        model_rows = [r for r in df.index if "예상요금" in r]
-        if len(model_rows) > 1:
-            model_vals = df.loc[model_rows].apply(pd.to_numeric, errors="coerce")
-            for col in model_vals.columns:
-                col_vals = model_vals[col].dropna()
-                if len(col_vals) == 0:
-                    continue
-                styles.loc[col_vals.idxmax(), col] = "background-color: #FFD700; font-weight: bold"
-                styles.loc[col_vals.idxmin(), col] = "background-color: #90EE90; font-weight: bold"
-        return styles
-
-    styled = display_df.style.apply(highlight_table, axis=None)
-    for row_label in display_df.index:
-        if "환율" in row_label:
-            fmt_str = "{:.0f}"
-        elif "예상요금" in row_label:
-            fmt_str = "{:.4f}"
+    btn_col, hint_col = st.columns([1, 4])
+    with btn_col:
+        run_btn = st.button(
+            "🚀 예측하기",
+            type="primary",
+            use_container_width=True,
+            disabled=(not selected_models),
+        )
+    with hint_col:
+        if not selected_models:
+            st.warning("⚠️ 사이드바에서 표시할 모델을 1개 이상 선택하세요.")
+        elif st.session_state.forecast_result is not None:
+            st.caption("✅ 아래에 가장 최근 예측 결과가 표시됩니다. 값을 수정한 뒤 **예측하기**를 다시 누르세요.")
         else:
-            fmt_str = "{:.2f}"
-        styled = styled.format(fmt_str, subset=pd.IndexSlice[row_label, :], na_rep="-")
+            st.caption("👆 시나리오 값을 설정한 뒤 **예측하기** 버튼을 눌러주세요.")
 
-    st.dataframe(styled, use_container_width=True)
-    st.caption("🟡 노란색: 해당 월 최고 예상요금 모델  |  🟢 초록색: 최저 예상요금 모델")
+    # 버튼 클릭 시 → session_state에 결과 저장
+    if run_btn and selected_models:
+        active_models = {k: v for k, v in models.items() if k in selected_models}
+        with st.spinner("🔮 예측 계산 중..."):
+            future_df = run_forecast(edited_df, active_models, feature_cols, preset_key)
+        st.session_state.forecast_result = future_df
+        st.session_state.forecast_snapshot = {
+            "edited_df":       edited_df.copy(),
+            "selected_models": selected_models[:],
+            "train_start":     train_start,
+            "train_end":       train_end,
+            "preset_key":      preset_key,
+            "feature_cols":    feature_cols[:],
+        }
+
+    # ── Step 2: 저장된 예측 결과 표시 ────────────────────
+    if st.session_state.forecast_result is not None:
+        snap        = st.session_state.forecast_snapshot
+        future_df   = st.session_state.forecast_result
+        s_edited_df     = snap["edited_df"]
+        s_selected      = snap["selected_models"]
+        s_train_start   = snap["train_start"]
+        s_train_end     = snap["train_end"]
+        s_preset_key    = snap["preset_key"]
+        s_feature_cols  = snap["feature_cols"]
+
+        st.markdown("### 📈 Step 2. AI 모델별 도매요금 예측 결과")
+
+        fig = plot_forecast(
+            y_all, y_all.index, future_df, last_date,
+            s_train_start, s_train_end, s_selected
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # ── Step 3: 가로형 수치 테이블 ───────────────────
+        st.subheader("📋 산업용 가스요금 전망 (원/MJ)")
+
+        date_cols = [d.strftime("%Y-%m") for d in sorted(future_df["Date"].unique())]
+        idx_df = s_edited_df.set_index("날짜")
+
+        pivot_raw = future_df.pivot(index="Date", columns="Model", values="Price")
+        pivot_raw.index = pivot_raw.index.strftime("%Y-%m")
+
+        table_rows: dict = {}
+        for lbl, tbl_lbl in TABLE_LABELS.items():
+            if lbl in idx_df.columns:
+                table_rows[tbl_lbl] = {
+                    d: idx_df.loc[d, lbl] if d in idx_df.index else "" for d in date_cols
+                }
+
+        for model_name in s_selected:
+            if model_name in pivot_raw.columns:
+                table_rows[f"예상요금 · {model_name}"] = {
+                    d: pivot_raw.loc[d, model_name] if d in pivot_raw.index else ""
+                    for d in date_cols
+                }
+
+        display_df = pd.DataFrame(table_rows, index=date_cols).T
+        display_df.index.name = "구분"
+
+        def highlight_table(df):
+            styles = pd.DataFrame("", index=df.index, columns=df.columns)
+            indicator_rows = [r for r in df.index if "예상요금" not in r]
+            for r in indicator_rows:
+                styles.loc[r, :] = "background-color: #f5f5f5; font-weight: bold"
+            model_rows = [r for r in df.index if "예상요금" in r]
+            if len(model_rows) > 1:
+                model_vals = df.loc[model_rows].apply(pd.to_numeric, errors="coerce")
+                for col in model_vals.columns:
+                    col_vals = model_vals[col].dropna()
+                    if len(col_vals) == 0:
+                        continue
+                    styles.loc[col_vals.idxmax(), col] = "background-color: #FFD700; font-weight: bold"
+                    styles.loc[col_vals.idxmin(), col] = "background-color: #90EE90; font-weight: bold"
+            return styles
+
+        styled = display_df.style.apply(highlight_table, axis=None)
+        for row_label in display_df.index:
+            if "환율" in row_label:
+                fmt_str = "{:.0f}"
+            elif "예상요금" in row_label:
+                fmt_str = "{:.4f}"
+            else:
+                fmt_str = "{:.2f}"
+            styled = styled.format(fmt_str, subset=pd.IndexSlice[row_label, :], na_rep="-")
+
+        st.dataframe(styled, use_container_width=True)
+        st.caption("🟡 노란색: 해당 월 최고 예상요금 모델  |  🟢 초록색: 최저 예상요금 모델")
 
 
 if __name__ == "__main__":
