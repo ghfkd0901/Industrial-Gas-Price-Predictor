@@ -7,7 +7,6 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import gspread
 from google.oauth2 import service_account
-from gspread_dataframe import get_as_dataframe
 
 # ───────────────────────────────
 # 🔑 1. 설정 및 데이터 로드 (캐싱)
@@ -28,25 +27,44 @@ def load_data():
     gc = get_gcp_client()
     sh = gc.open_by_key(SHEET_ID)
 
+    # ── Master_Data ──
     ws_master = sh.worksheet("Master_Data")
-    master_df = get_as_dataframe(ws_master).dropna(how='all').dropna(axis=1, how='all')
-    master_df.iloc[:, 0] = pd.to_datetime(master_df.iloc[:, 0])
-    master_df = master_df.set_index(master_df.columns[0])
+    raw_master = ws_master.get_all_values()
+    master_df = pd.DataFrame(raw_master[1:], columns=raw_master[0])
+    master_df = master_df.replace('', np.nan).dropna(how='all').dropna(axis=1, how='all')
 
+    date_col = master_df.columns[0]
+    master_df[date_col] = pd.to_datetime(master_df[date_col], errors='coerce')
+    master_df = master_df.dropna(subset=[date_col])
+    master_df = master_df.set_index(date_col)
+
+    for col in master_df.columns:
+        master_df[col] = pd.to_numeric(
+            master_df[col].astype(str).str.replace(',', ''), errors='coerce'
+        )
+
+    # ── gas_price ──
     ws_gas = sh.worksheet("gas_price")
-    gas_df = get_as_dataframe(ws_gas).dropna(how='all').dropna(axis=1, how='all')
-    gas_df.iloc[:, 0] = pd.to_datetime(gas_df.iloc[:, 0])
-    gas_df = gas_df.set_index(gas_df.columns[0])
-    gas_df.columns = ['Wholesale_Price']
+    raw_gas = ws_gas.get_all_values()
+    gas_df = pd.DataFrame(raw_gas[1:], columns=raw_gas[0])
+    gas_df = gas_df.replace('', np.nan).dropna(how='all').dropna(axis=1, how='all')
 
-    # 두 시트의 겹치는 기간으로 월별 인덱스 생성
+    date_col_g = gas_df.columns[0]
+    gas_df[date_col_g] = pd.to_datetime(gas_df[date_col_g], errors='coerce')
+    gas_df = gas_df.dropna(subset=[date_col_g])
+    gas_df = gas_df.set_index(date_col_g)
+    gas_df.columns = ['Wholesale_Price']
+    gas_df['Wholesale_Price'] = pd.to_numeric(
+        gas_df['Wholesale_Price'].astype(str).str.replace(',', ''), errors='coerce'
+    )
+
+    # ── 월별 인덱스 정렬 및 병합 ──
     monthly_idx = pd.date_range(
         start=max(master_df.index.min(), gas_df.index.min()),
         end=min(master_df.index.max(), gas_df.index.max()),
         freq='MS'
     )
 
-    # 각 시트를 월별 격자에 맞춰 시간 기반 보간
     master_df = (master_df
                  .reindex(master_df.index.union(monthly_idx))
                  .interpolate(method='time')
@@ -79,7 +97,10 @@ for col in features:
             best_corr = abs(current_corr)
             best_lag_val = i
 
-    best_lags[col] = {'Lag': best_lag_val, 'Corr': merged['Wholesale_Price'].corr(merged[col].shift(best_lag_val))}
+    best_lags[col] = {
+        'Lag': best_lag_val,
+        'Corr': merged['Wholesale_Price'].corr(merged[col].shift(best_lag_val))
+    }
     lagged_df[f"{col}(Lag:{best_lag_val})"] = merged[col].shift(best_lag_val)
 
 lagged_df = lagged_df.dropna()
@@ -186,7 +207,8 @@ for i in range(0, len(lagged_cols), 2):
                     x=x_vals,
                     y=y_vals,
                     mode='markers',
-                    marker=dict(color=BLUE, opacity=0.5, size=6, line=dict(width=0.5, color='white')),
+                    marker=dict(color=BLUE, opacity=0.5, size=6,
+                                line=dict(width=0.5, color='white')),
                     hovertemplate=f"{target_col}: %{{x:.2f}}<br>도매요금: %{{y:.2f}}<extra></extra>"
                 ))
                 fig_sc.add_trace(go.Scatter(
@@ -228,7 +250,6 @@ def minmax_norm(series):
 
 fig_ts = go.Figure()
 
-# 도매요금 (굵은 실선)
 fig_ts.add_trace(go.Scatter(
     x=merged.index,
     y=minmax_norm(merged['Wholesale_Price']),
@@ -238,7 +259,6 @@ fig_ts.add_trace(go.Scatter(
     hovertemplate="날짜: %{x|%Y-%m}<br>도매요금: %{customdata} 원/MJ<extra></extra>"
 ))
 
-# 각 피처 정규화 (점선)
 for idx, col_name in enumerate(features):
     lag_val = int(best_lags[col_name]['Lag'])
     color   = axis_colors[(idx + 1) % len(axis_colors)]
@@ -255,7 +275,10 @@ for idx, col_name in enumerate(features):
     ))
 
 fig_ts.update_layout(
-    title=dict(text="📊 도매요금 vs 국제 지표 통합 비교 (정규화, 각 지표별 최적 래그 적용)", font=dict(size=15)),
+    title=dict(
+        text="📊 도매요금 vs 국제 지표 통합 비교 (정규화, 각 지표별 최적 래그 적용)",
+        font=dict(size=15)
+    ),
     xaxis=dict(
         title="날짜",
         showgrid=True,
@@ -271,7 +294,8 @@ fig_ts.update_layout(
     ),
     height=550,
     hovermode='x unified',
-    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0, font=dict(size=11)),
+    legend=dict(orientation='h', yanchor='bottom', y=1.02,
+                xanchor='left', x=0, font=dict(size=11)),
     plot_bgcolor='rgba(248,249,250,1)',
     paper_bgcolor='rgba(0,0,0,0)',
     margin=dict(l=60, r=40, t=80, b=80)

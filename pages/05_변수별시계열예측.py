@@ -7,7 +7,6 @@ from statsmodels.tsa.holtwinters import SimpleExpSmoothing, Holt
 from dateutil.relativedelta import relativedelta
 import gspread
 from google.oauth2 import service_account
-from gspread_dataframe import get_as_dataframe
 
 # ───────────────────────────────
 # 상수
@@ -53,17 +52,28 @@ def get_gcp_client():
 def load_master() -> pd.DataFrame:
     gc = get_gcp_client()
     sh = gc.open_by_key(SHEET_ID)
-    df = get_as_dataframe(sh.worksheet("Master_Data")).dropna(how="all").dropna(axis=1, how="all")
-    df.iloc[:, 0] = pd.to_datetime(df.iloc[:, 0])
-    df = df.set_index(df.columns[0]).sort_index().ffill()
-    return df
+
+    ws = sh.worksheet("Master_Data")
+    raw = ws.get_all_values()
+    df = pd.DataFrame(raw[1:], columns=raw[0])
+    df = df.replace('', np.nan).dropna(how='all').dropna(axis=1, how='all')
+
+    date_col = df.columns[0]
+    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+    df = df.dropna(subset=[date_col]).set_index(date_col).sort_index()
+
+    for col in df.columns:
+        df[col] = pd.to_numeric(
+            df[col].astype(str).str.replace(',', ''), errors='coerce'
+        )
+
+    return df.ffill()
 
 
 # ───────────────────────────────
 # Holt 예측
 # ───────────────────────────────
 def holt_forecast(series: pd.Series, n: int) -> tuple[np.ndarray, object]:
-    """예측값 배열과 fit 객체 반환"""
     s = series.astype(float).dropna()
     try:
         fit = Holt(s, exponential=False).fit(optimized=True)
@@ -91,12 +101,10 @@ def make_chart(
     last_date  = series.index[-1]
     last_val   = float(series.iloc[-1])
 
-    # 히스토리 필터
     hist = series[series.index >= hist_start]
 
     fig = go.Figure()
 
-    # ① 실제 과거값
     fig.add_trace(go.Scatter(
         x=hist.index, y=hist.values,
         name="실제값",
@@ -104,7 +112,6 @@ def make_chart(
         hovertemplate=f"%{{x|%Y-%m}}<br>실제: %{{y:,.2f}} {unit}<extra></extra>",
     ))
 
-    # ② 예측 연결선 (실제 마지막 → 예측 첫번째)
     connect_x = [last_date] + list(forecast_dates)
     connect_y = [last_val]  + list(forecast_vals)
     fig.add_trace(go.Scatter(
@@ -114,7 +121,6 @@ def make_chart(
         hovertemplate=f"%{{x|%Y-%m}}<br>예측: %{{y:,.2f}} {unit}<extra></extra>",
     ))
 
-    # ③ 예측 구간 음영 (±10% 신뢰대)
     upper = np.array(forecast_vals) * 1.10
     lower = np.array(forecast_vals) * 0.90
     fig.add_trace(go.Scatter(
@@ -127,7 +133,6 @@ def make_chart(
         hoverinfo="skip",
     ))
 
-    # ④ 현재 기준선
     fig.add_vline(
         x=last_date.timestamp() * 1000,
         line_dash="dash", line_color="gray", line_width=1.2,
@@ -159,7 +164,6 @@ def main():
     st.title("📈 변수 시계열 예측")
     st.caption("브렌트유 · JKM · 환율의 Holt 이중지수평활법(Double Exponential Smoothing) 예측 결과를 시각화합니다.")
 
-    # ── 데이터 로드 ───────────────────────────────────────
     with st.spinner("📡 데이터 불러오는 중..."):
         try:
             master = load_master()
@@ -169,7 +173,6 @@ def main():
 
     last_date = master.index.max()
 
-    # ── 사이드바 설정 ─────────────────────────────────────
     with st.sidebar:
         st.header("⚙️ 예측 설정")
 
@@ -203,20 +206,17 @@ def main():
             st.rerun()
         st.caption(f"📅 데이터 기준: **{last_date.strftime('%Y-%m')}**")
 
-    # ── 예측 날짜 인덱스 ──────────────────────────────────
     forecast_dates = pd.date_range(
         start=last_date + relativedelta(months=1),
         periods=forecast_months,
         freq="MS",
     )
 
-    # ── 변수별 차트 ───────────────────────────────────────
     selected = [name for name, show in show_vars.items() if show]
     if not selected:
         st.warning("⚠️ 사이드바에서 변수를 1개 이상 선택하세요.")
         st.stop()
 
-    # 예측 결과 summary 테이블용
     summary_rows = []
 
     for var_name in selected:
@@ -230,11 +230,9 @@ def main():
         series = master[col].dropna()
         forecast_vals, fit = holt_forecast(series, forecast_months)
 
-        # 차트
         fig = make_chart(series, forecast_vals, forecast_dates, var_name, cfg, hist_start)
         st.plotly_chart(fig, use_container_width=True)
 
-        # 모델 파라미터 표시
         with st.expander(f"🔧 {var_name} — 모델 파라미터 & 예측 수치", expanded=False):
             p_col1, p_col2, p_col3 = st.columns(3)
             try:
@@ -247,7 +245,6 @@ def main():
             except Exception:
                 st.caption("파라미터 정보를 불러올 수 없습니다.")
 
-            # 예측 수치 테이블
             pred_df = pd.DataFrame({
                 "날짜":  forecast_dates.strftime("%Y-%m"),
                 f"예측값 ({cfg['unit']})": np.round(forecast_vals, 2),
@@ -256,7 +253,6 @@ def main():
             })
             st.dataframe(pred_df, hide_index=True, use_container_width=True)
 
-        # summary용 수집
         summary_rows.append({
             "변수": f"{cfg['icon']} {var_name}",
             "단위": cfg["unit"],
@@ -269,21 +265,16 @@ def main():
 
         st.divider()
 
-    # ── 요약 테이블 ───────────────────────────────────────
     if summary_rows:
         st.subheader("📋 예측 요약")
         summary_df = pd.DataFrame(summary_rows).set_index("변수")
 
-        # 예측 컬럼만 표시 (forecast_months 범위 내)
         show_cols = ["단위", "현재값", "1개월 후"]
         if forecast_months >= 3:  show_cols.append("3개월 후")
         if forecast_months >= 6:  show_cols.append("6개월 후")
         if forecast_months >= 12: show_cols.append("12개월 후")
 
-        st.dataframe(
-            summary_df[show_cols],
-            use_container_width=True,
-        )
+        st.dataframe(summary_df[show_cols], use_container_width=True)
         st.caption("※ Holt 이중지수평활법 예측값 기준 | ±10% 범위는 단순 참고용입니다.")
 
 

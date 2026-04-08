@@ -11,7 +11,6 @@ from statsmodels.tsa.holtwinters import SimpleExpSmoothing, Holt
 from dateutil.relativedelta import relativedelta
 import gspread
 from google.oauth2 import service_account
-from gspread_dataframe import get_as_dataframe
 
 # ───────────────────────────────
 # 상수 정의
@@ -72,16 +71,38 @@ def load_all_data():
     gc = get_gcp_client()
     sh = gc.open_by_key(SHEET_ID)
 
-    m_raw = get_as_dataframe(sh.worksheet("Master_Data")).dropna(how="all").dropna(axis=1, how="all")
-    m_raw.iloc[:, 0] = pd.to_datetime(m_raw.iloc[:, 0])
-    m_raw = m_raw.set_index(m_raw.columns[0]).sort_index().ffill()
+    # ── Master_Data
+    ws_master = sh.worksheet("Master_Data")
+    raw_master = ws_master.get_all_values()
+    m_raw = pd.DataFrame(raw_master[1:], columns=raw_master[0])
+    m_raw = m_raw.replace('', np.nan).dropna(how='all').dropna(axis=1, how='all')
 
-    g_raw = get_as_dataframe(sh.worksheet("gas_price")).dropna(how="all").dropna(axis=1, how="all")
-    g_raw.iloc[:, 0] = pd.to_datetime(g_raw.iloc[:, 0])
-    g_raw = g_raw.set_index(g_raw.columns[0]).sort_index().ffill()
-    g_raw.columns = ["Wholesale_Price"]
+    date_col = m_raw.columns[0]
+    m_raw[date_col] = pd.to_datetime(m_raw[date_col], errors='coerce')
+    m_raw = m_raw.dropna(subset=[date_col]).set_index(date_col).sort_index()
+    for col in m_raw.columns:
+        m_raw[col] = pd.to_numeric(
+            m_raw[col].astype(str).str.replace(',', ''), errors='coerce'
+        )
+    m_raw = m_raw.ffill()
 
-    merged = m_raw.join(g_raw, how="inner")
+    # ── gas_price
+    ws_gas = sh.worksheet("gas_price")
+    raw_gas = ws_gas.get_all_values()
+    g_raw = pd.DataFrame(raw_gas[1:], columns=raw_gas[0])
+    g_raw = g_raw.replace('', np.nan).dropna(how='all').dropna(axis=1, how='all')
+
+    date_col_g = g_raw.columns[0]
+    g_raw[date_col_g] = pd.to_datetime(g_raw[date_col_g], errors='coerce')
+    g_raw = g_raw.dropna(subset=[date_col_g]).set_index(date_col_g).sort_index()
+    g_raw.columns = ['Wholesale_Price']
+    g_raw['Wholesale_Price'] = pd.to_numeric(
+        g_raw['Wholesale_Price'].astype(str).str.replace(',', ''), errors='coerce'
+    )
+    g_raw = g_raw.ffill()
+
+    # ── 병합 및 Lag 피처 생성
+    merged = m_raw.join(g_raw, how='inner')
     for col, lag in COL_LAG.items():
         if col in merged.columns:
             merged[f"{col}_Lag{lag}"] = merged[col].shift(lag)
@@ -302,7 +323,6 @@ def plot_forecast(
 def main():
     st.title("🏛️ 대성에너지 도매요금 AI 시뮬레이션 시스템")
 
-    # ── session_state 초기화 ──────────────────────────────
     if "forecast_result" not in st.session_state:
         st.session_state.forecast_result = None
     if "forecast_snapshot" not in st.session_state:
@@ -317,11 +337,9 @@ def main():
 
     last_date = merged["Wholesale_Price"].dropna().index.max()
 
-    # ── 사이드바 ──────────────────────────────────────────
     with st.sidebar:
         st.header("⚙️ 시뮬레이션 설정")
 
-        # 1) 피처 조합 선택
         st.subheader("🔢 입력 변수 선택")
         preset_key = st.radio(
             "예측에 사용할 변수 조합을 선택하세요",
@@ -337,7 +355,6 @@ def main():
 
         st.divider()
 
-        # 2) 모델 학습 기간 설정
         st.subheader("🎓 모델 학습 기간")
         st.caption("선택한 기간의 데이터로만 모델을 학습합니다.")
 
@@ -361,7 +378,6 @@ def main():
 
         st.divider()
 
-        # 3) 예측 기간
         st.subheader("📅 예측 기간 설정")
         default_start = last_date + relativedelta(months=1)
         default_end   = last_date + relativedelta(months=12)
@@ -398,7 +414,6 @@ def main():
 
         st.divider()
 
-        # 4) 지수평활법 선택
         input_mode = st.radio(
             "미래 지표 생성 방식",
             ["직접 입력 (사용자 지정)", "지수평활법 (자동 트렌드 예측)"],
@@ -408,7 +423,6 @@ def main():
 
         st.divider()
 
-        # 5) 표시 모델 선택
         st.subheader("📊 표시 모델 선택")
         selected_models = [n for n in MODEL_COLORS if st.checkbox(n, value=True)]
 
@@ -420,7 +434,6 @@ def main():
             st.rerun()
         st.caption(f"📅 데이터 기준: **{last_date.strftime('%Y-%m')}**")
 
-    # ── 모델 학습 ─────────────────────────────────────────
     X, y = get_train_xy(merged, feature_cols, train_start, train_end)
     if X.empty or len(X) < 10:
         st.error(
@@ -436,7 +449,6 @@ def main():
     with st.spinner("🤖 AI 모델 학습 중..."):
         models = build_models(X, y)
 
-    # ── R² 스코어 표시 ─────────────────────────────────────
     r2_cols = st.columns(4)
     for i, (name, model) in enumerate(models.items()):
         r2_tr  = r2_score(y,        model.predict(X))
@@ -449,7 +461,6 @@ def main():
             help=f"학습기간({train_start_year}~{train_end_year}) R² vs 전체기간 R²",
         )
 
-    # ── Step 1: 시나리오 에디터 ───────────────────────────
     st.markdown("### 📅 Step 1. 미래 지표 시나리오 설정")
 
     scenario_df = build_scenario_df(
@@ -482,7 +493,6 @@ def main():
         height=min(35 * forecast_months + 60, 500),
     )
 
-    # ── 예측하기 버튼 ─────────────────────────────────────
     st.divider()
 
     btn_col, hint_col = st.columns([1, 4])
@@ -515,7 +525,6 @@ def main():
             "feature_cols":    feature_cols[:],
         }
 
-    # ── Step 2 & 3: 저장된 예측 결과 표시 ───────────────
     if st.session_state.forecast_result is not None:
         snap           = st.session_state.forecast_snapshot
         future_df      = st.session_state.forecast_result
@@ -534,37 +543,31 @@ def main():
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # ── Step 3: 날짜별 세로형 테이블 ─────────────────
         st.subheader("📋 산업용 가스요금 전망 (원/MJ)")
 
         lag_cols_snap, nolag_cols_snap = FEATURE_PRESETS[s_preset_key]
 
-        # 컬럼 헤더 동적 생성: 시차 정보 포함
-        header_map = {}   # {원본 라벨: 표시 헤더}
+        header_map = {}
         for col in lag_cols_snap:
             lag = COL_LAG[col]
-            label = COL_LABELS[col]                              # ex) "브렌트유($)"
-            base = label.replace("($)", "").strip()              # ex) "브렌트유"
-            header_map[label] = f"{base} [Lag {lag}M] ($)"      # ex) "브렌트유 [Lag 6M] ($)"
+            label = COL_LABELS[col]
+            base = label.replace("($)", "").strip()
+            header_map[label] = f"{base} [Lag {lag}M] ($)"
         for col in nolag_cols_snap:
-            label = COL_LABELS[col]                              # ex) "환율(원)"
-            header_map[label] = label                            # 시차 없으면 그대로
+            label = COL_LABELS[col]
+            header_map[label] = label
 
-        # 날짜 정렬 & 인덱스
         date_list = sorted(future_df["Date"].unique())
         idx_df    = s_edited_df.set_index("날짜")
 
-        # 행 조립
         rows = []
         for d in date_list:
             d_str = d.strftime("%Y-%m")
             row = {"날짜": d_str}
 
-            # 입력 지표
             for orig_lbl, new_lbl in header_map.items():
                 row[new_lbl] = idx_df.loc[d_str, orig_lbl] if d_str in idx_df.index else None
 
-            # 모델별 예측 요금
             for model_name in s_selected:
                 mdf = future_df[(future_df["Date"] == d) & (future_df["Model"] == model_name)]
                 row[model_name] = float(mdf["Price"].iloc[0]) if not mdf.empty else None
@@ -573,21 +576,17 @@ def main():
 
         display_df = pd.DataFrame(rows).set_index("날짜")
 
-        # 컬럼 그룹 정의
         indicator_cols = list(header_map.values())
         model_cols     = [m for m in s_selected if m in display_df.columns]
 
-        # 스타일: 행 단위 최고/최저 하이라이트
         def highlight_row(row):
             styles = [""] * len(row)
             col_index = list(row.index)
 
-            # 입력 지표 컬럼: 회색 배경
             for i, c in enumerate(col_index):
                 if c in indicator_cols:
                     styles[i] = "background-color: #f5f5f5; font-weight: bold"
 
-            # 모델 컬럼: 같은 행(같은 달)에서 최고/최저 비교
             model_vals = {c: row[c] for c in model_cols if pd.notna(row.get(c))}
             if len(model_vals) > 1:
                 max_model = max(model_vals, key=model_vals.get)
@@ -602,7 +601,6 @@ def main():
 
         styled = display_df.style.apply(highlight_row, axis=1)
 
-        # 포맷: 지표/모델별 소수점 자릿수
         for c in indicator_cols:
             if c in display_df.columns:
                 fmt = "{:.0f}" if "환율" in c else "{:.2f}"

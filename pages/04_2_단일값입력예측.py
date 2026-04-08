@@ -8,7 +8,6 @@ from xgboost import XGBRegressor
 from sklearn.metrics import r2_score
 import gspread
 from google.oauth2 import service_account
-from gspread_dataframe import get_as_dataframe
 
 # ───────────────────────────────
 # 페이지 설정
@@ -27,7 +26,6 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Noto+Sans+KR:wght@300;400;500;700&family=JetBrains+Mono:wght@400;600&display=swap');
 
-/* 전체 배경 */
 [data-testid="stAppViewContainer"] {
     background: #0a0e1a;
     background-image:
@@ -37,13 +35,11 @@ st.markdown("""
 [data-testid="stHeader"] { background: transparent; }
 [data-testid="stSidebar"] { background: #0d1120; }
 
-/* 메인 폰트 */
 html, body, [class*="css"] {
     font-family: 'Noto Sans KR', sans-serif;
     color: #e8eaf0;
 }
 
-/* 타이틀 영역 */
 .hero-title {
     font-family: 'Bebas Neue', sans-serif;
     font-size: 3.2rem;
@@ -61,7 +57,6 @@ html, body, [class*="css"] {
     margin-bottom: 2rem;
 }
 
-/* 입력 패널 */
 .input-panel {
     background: rgba(255,255,255,0.04);
     border: 1px solid rgba(255,255,255,0.08);
@@ -85,7 +80,6 @@ html, body, [class*="css"] {
     margin-top: 0.2rem;
 }
 
-/* 예측 카드 — st.columns 안에서 렌더링 */
 .pred-card {
     border-radius: 14px;
     padding: 1.4rem 1.6rem;
@@ -153,14 +147,12 @@ html, body, [class*="css"] {
 .badge-min { background: rgba(100,220,120,0.18); color: #6edc78; border: 1px solid rgba(100,220,120,0.45); }
 .badge-mid { background: rgba(255,255,255,0.06); color: #7888a8; border: 1px solid rgba(255,255,255,0.12); }
 
-/* 구분선 */
 .divider {
     border: none;
     border-top: 1px solid rgba(255,255,255,0.07);
     margin: 1.5rem 0;
 }
 
-/* 데이터 기준 뱃지 */
 .data-badge {
     display: inline-flex;
     align-items: center;
@@ -175,7 +167,6 @@ html, body, [class*="css"] {
     margin-bottom: 1.5rem;
 }
 
-/* 학습 기간 슬라이더 레이블 */
 .train-label {
     font-size: 0.68rem;
     color: #4a7fd4;
@@ -184,7 +175,6 @@ html, body, [class*="css"] {
     margin-bottom: 0.3rem;
 }
 
-/* streamlit 기본 요소 덮어쓰기 */
 div[data-testid="stNumberInput"] label { color: #8892a4 !important; font-size: 0.8rem !important; }
 div[data-testid="stSelectSlider"] label { color: #8892a4 !important; font-size: 0.8rem !important; }
 div[data-testid="stButton"] button[kind="primary"] {
@@ -238,16 +228,38 @@ def load_data():
     gc = get_gcp_client()
     sh = gc.open_by_key(SHEET_ID)
 
-    m_raw = get_as_dataframe(sh.worksheet("Master_Data")).dropna(how="all").dropna(axis=1, how="all")
-    m_raw.iloc[:, 0] = pd.to_datetime(m_raw.iloc[:, 0])
-    m_raw = m_raw.set_index(m_raw.columns[0]).sort_index().ffill()
+    # ── Master_Data
+    ws_master = sh.worksheet("Master_Data")
+    raw_master = ws_master.get_all_values()
+    m_raw = pd.DataFrame(raw_master[1:], columns=raw_master[0])
+    m_raw = m_raw.replace('', np.nan).dropna(how='all').dropna(axis=1, how='all')
 
-    g_raw = get_as_dataframe(sh.worksheet("gas_price")).dropna(how="all").dropna(axis=1, how="all")
-    g_raw.iloc[:, 0] = pd.to_datetime(g_raw.iloc[:, 0])
-    g_raw = g_raw.set_index(g_raw.columns[0]).sort_index().ffill()
-    g_raw.columns = ["Wholesale_Price"]
+    date_col = m_raw.columns[0]
+    m_raw[date_col] = pd.to_datetime(m_raw[date_col], errors='coerce')
+    m_raw = m_raw.dropna(subset=[date_col]).set_index(date_col).sort_index()
+    for col in m_raw.columns:
+        m_raw[col] = pd.to_numeric(
+            m_raw[col].astype(str).str.replace(',', ''), errors='coerce'
+        )
+    m_raw = m_raw.ffill()
 
-    merged = m_raw.join(g_raw, how="inner")
+    # ── gas_price
+    ws_gas = sh.worksheet("gas_price")
+    raw_gas = ws_gas.get_all_values()
+    g_raw = pd.DataFrame(raw_gas[1:], columns=raw_gas[0])
+    g_raw = g_raw.replace('', np.nan).dropna(how='all').dropna(axis=1, how='all')
+
+    date_col_g = g_raw.columns[0]
+    g_raw[date_col_g] = pd.to_datetime(g_raw[date_col_g], errors='coerce')
+    g_raw = g_raw.dropna(subset=[date_col_g]).set_index(date_col_g).sort_index()
+    g_raw.columns = ['Wholesale_Price']
+    g_raw['Wholesale_Price'] = pd.to_numeric(
+        g_raw['Wholesale_Price'].astype(str).str.replace(',', ''), errors='coerce'
+    )
+    g_raw = g_raw.ffill()
+
+    # ── 병합 및 Lag 피처 생성
+    merged = m_raw.join(g_raw, how='inner')
     merged[f"Brent_Lag{BRENT_LAG}"] = merged["Brent"].shift(BRENT_LAG)
 
     return merged
@@ -280,7 +292,7 @@ def train_models(merged: pd.DataFrame, train_start: pd.Timestamp, train_end: pd.
 
 
 # ───────────────────────────────
-# 예측 카드 렌더링 (st.columns 기반)
+# 예측 카드 렌더링
 # ───────────────────────────────
 def render_cards(predictions: dict, r2_scores: dict):
     prices  = list(predictions.values())
@@ -288,7 +300,6 @@ def render_cards(predictions: dict, r2_scores: dict):
     min_val = min(prices)
 
     items = list(predictions.items())
-    # 2행 2열 레이아웃
     for row_items in [items[:2], items[2:]]:
         cols = st.columns(2, gap="small")
         for col, (name, price) in zip(cols, row_items):
@@ -319,13 +330,11 @@ def render_cards(predictions: dict, r2_scores: dict):
 # ───────────────────────────────
 def main():
 
-    # ── 헤더 ──────────────────────────────────────────────
     st.markdown("""
     <div class="hero-title">QUICK PREDICT</div>
     <div class="hero-sub">⚡ 도매요금 즉시 예측기 · Daesung Energy</div>
     """, unsafe_allow_html=True)
 
-    # ── 데이터 로드 ────────────────────────────────────────
     with st.spinner("데이터 로딩 중..."):
         try:
             merged = load_data()
@@ -343,7 +352,6 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # ── 학습 기간 설정 (사이드바) ─────────────────────────
     with st.sidebar:
         st.markdown("### ⚙️ 모델 설정")
         available_years = sorted(merged.index.year.unique())
@@ -364,7 +372,6 @@ def main():
             st.cache_data.clear()
             st.rerun()
 
-    # ── 모델 학습 ──────────────────────────────────────────
     with st.spinner("🤖 모델 학습 중..."):
         try:
             models, r2_scores, n_train, feature_cols = train_models(merged, train_start, train_end)
@@ -372,7 +379,6 @@ def main():
             st.error(f"❌ 모델 학습 실패: {e}")
             st.stop()
 
-    # ── 입력 패널 ──────────────────────────────────────────
     st.markdown('<div class="input-panel">', unsafe_allow_html=True)
     st.markdown('<div class="input-label">입력값 설정</div>', unsafe_allow_html=True)
 
@@ -406,10 +412,8 @@ def main():
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── 예측 실행 버튼 ─────────────────────────────────────
     run_btn = st.button("⚡  예측하기", type="primary", use_container_width=True)
 
-    # ── 결과 표시 ──────────────────────────────────────────
     if run_btn:
         X_pred = pd.DataFrame(
             [[brent_input, krw_input]],
